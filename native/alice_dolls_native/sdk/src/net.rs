@@ -254,6 +254,8 @@ pub struct ShownTrade {
     pub stock: u32,
     /// Whether the viewer has what it takes.
     pub affordable: bool,
+    /// For each part, what an enchanted book in it holds ("Sharpness III, Mending"); else empty.
+    pub notes: [String; crate::joon::PARTS],
 }
 
 /// A player she can be sent to.
@@ -315,6 +317,7 @@ pub fn encode_joon(v: Option<&JoonView>) -> Vec<u8> {
         t.parts.iter().for_each(|p| put_shown(&mut w, p));
         w.u32(t.stock);
         w.u8(u8::from(t.affordable));
+        t.notes.iter().for_each(|n| w.str(n));
     }
     let items = &v.items[..v.items.len().min(MAX_JOON)];
     w.u16(items.len());
@@ -347,7 +350,12 @@ pub fn decode_joon(data: &[u8]) -> Result<Option<JoonView>, ()> {
                 for p in &mut parts {
                     *p = read_shown(r)?;
                 }
-                Some(ShownTrade { parts, stock: r.u32()?, affordable: r.u8()? != 0 })
+                let (stock, affordable) = (r.u32()?, r.u8()? != 0);
+                let mut notes: [String; crate::joon::PARTS] = Default::default();
+                for n in &mut notes {
+                    *n = r.str()?;
+                }
+                Some(ShownTrade { parts, stock, affordable, notes })
             })
             .collect::<Option<Vec<_>>>()?;
         let n = r.count(MAX_JOON)?;
@@ -561,6 +569,7 @@ mod tests {
                 ],
                 stock: 4,
                 affordable: true,
+                notes: std::array::from_fn(|p| if p == 1 { "Sharpness III, Mending".into() } else { String::new() }),
             }],
             items: vec![None, Some(("minecraft:dirt".into(), 64))],
             players: vec![ShownPlayer { uuid: u128::MAX - 7, name: "Steve".into(), wait: 30, you: false }],

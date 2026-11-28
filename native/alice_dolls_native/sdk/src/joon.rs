@@ -86,9 +86,102 @@ pub fn same(a: &ItemStack, b: &ItemStack) -> bool {
     a.item == b.item && a.damage == b.damage && a.extra == b.extra
 }
 
+pub const BOOK: &str = "minecraft:enchanted_book";
+
+/// Whether `have` pays for `want` in a trade. An enchanted book asked for pays with any enchanted
+/// book that holds each of its enchantments at that level or higher, whatever else it holds or
+/// however it was named or repaired (a book asking for none takes any enchanted book); anything
+/// else, only the same item.
+pub fn pays(have: &ItemStack, want: &ItemStack) -> bool {
+    if want.item != BOOK {
+        return same(have, want);
+    }
+    if have.item != BOOK {
+        return false;
+    }
+    let held = have.stored_enchantments();
+    want.stored_enchantments()
+        .iter()
+        .all(|(id, level)| held.iter().any(|(h, l)| h == id && l >= level))
+}
+
+/// What a trade asks for when `stack` is put in a price slot: an enchanted book becomes just its
+/// enchantments (not its name or repair cost), so any book with them pays; anything else as it is.
+pub fn asked_for(stack: ItemStack) -> ItemStack {
+    if stack.item != BOOK {
+        return stack;
+    }
+    let mut book = ItemStack::book_of(&stack.stored_enchantments());
+    book.count = stack.count;
+    book
+}
+
+/// An enchanted book's enchantments as a player reads them: "Sharpness III, Mending". Empty for
+/// anything else.
+pub fn book_note(s: &ItemStack) -> String {
+    if s.item != BOOK {
+        return String::new();
+    }
+    s.stored_enchantments()
+        .iter()
+        .map(|(id, level)| {
+            let name = id.rsplit(':').next().unwrap_or(id);
+            let mut name: String = name
+                .split('_')
+                .map(|w| {
+                    let mut c = w.chars();
+                    c.next().map(|f| f.to_uppercase().chain(c).collect::<String>()).unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            if *level > 1 {
+                name.push(' ');
+                name.push_str(&roman(*level));
+            }
+            name
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn roman(n: u32) -> String {
+    const R: [&str; 10] = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X"];
+    R.get(n as usize - 1).map_or_else(|| n.to_string(), |r| (*r).to_owned())
+}
+
 /// How many of `want` are in `items`.
 pub fn count_in(items: &[Option<ItemStack>], want: &ItemStack) -> u32 {
     items.iter().flatten().filter(|s| same(s, want)).map(|s| s.count).sum()
+}
+
+/// What the player pays for `trade` once, out of `have`: for each slot, how many it gives. Each
+/// thing asked for takes from the stacks that pay for it, in slot order; None when they can't pay.
+pub fn payment(have: &[Option<ItemStack>], trade: &Trade) -> Option<Vec<(usize, u32)>> {
+    let mut left: Vec<u32> = have.iter().map(|s| s.as_ref().map_or(0, |s| s.count)).collect();
+    let mut out: Vec<(usize, u32)> = Vec::new();
+    for want in trade.cost.iter().flatten() {
+        let mut need = want.count;
+        for (i, s) in have.iter().enumerate() {
+            if need == 0 {
+                break;
+            }
+            let Some(s) = s else { continue };
+            if left[i] == 0 || !pays(s, want) {
+                continue;
+            }
+            let k = left[i].min(need);
+            left[i] -= k;
+            need -= k;
+            match out.iter_mut().find(|(slot, _)| *slot == i) {
+                Some((_, n)) => *n += k,
+                None => out.push((i, k)),
+            }
+        }
+        if need > 0 {
+            return None;
+        }
+    }
+    Some(out)
 }
 
 /// Takes `n` of `want` out of `items`, from the last slot back; all or nothing.
@@ -153,16 +246,17 @@ pub fn stock_for(items: &[Option<ItemStack>], trade: &Trade) -> Option<u32> {
     summed(trade.result.iter().flatten()).iter().map(|r| count_in(items, r) / r.count.max(1)).min()
 }
 
-/// Her side of one trade: what it pays out comes out of `items` and what it takes goes in. `max`
-/// is an item's stack size. Unchanged, and Err with why, when it can't be done.
-pub fn joon_side(items: &mut [Option<ItemStack>], trade: &Trade, max: impl Fn(&str) -> u32) -> Result<(), &'static str> {
+/// Her side of one trade: what it pays out comes out of `items` and what she is paid (`paid`, the
+/// very stacks the player gave) goes in. `max` is an item's stack size. Unchanged, and Err with
+/// why, when it can't be done.
+pub fn joon_side(items: &mut [Option<ItemStack>], trade: &Trade, paid: &[ItemStack], max: impl Fn(&str) -> u32) -> Result<(), &'static str> {
     let mut after = items.to_vec();
     for r in summed(trade.result.iter().flatten()) {
         if !take_from(&mut after, &r, r.count) {
             return Err("out of stock");
         }
     }
-    for c in trade.cost.iter().flatten() {
+    for c in paid {
         if put_into(&mut after, c.clone(), max(&c.item)).is_some() {
             return Err("full");
         }
@@ -173,8 +267,19 @@ pub fn joon_side(items: &mut [Option<ItemStack>], trade: &Trade, max: impl Fn(&s
 
 /// Whether `have` (the player's inventory) holds what `trade` takes.
 pub fn can_pay(have: &[Option<ItemStack>], trade: &Trade) -> bool {
-    // Costs of the same item take from the same stacks.
-    summed(trade.cost.iter().flatten()).iter().all(|n| count_in(have, n) >= n.count)
+    payment(have, trade).is_some()
+}
+
+/// The stacks `payment` takes out of `have`, as they are (a book with all its enchantments).
+pub fn paid_stacks(have: &[Option<ItemStack>], payment: &[(usize, u32)]) -> Vec<ItemStack> {
+    payment
+        .iter()
+        .filter_map(|&(i, n)| {
+            let mut s = have.get(i)?.clone()?;
+            s.count = n;
+            Some(s)
+        })
+        .collect()
 }
 
 // ---- Saving ----
@@ -303,6 +408,55 @@ mod tests {
         t
     }
 
+    /// What a trade asks for, as the player pays it.
+    fn costs(t: &Trade) -> Vec<ItemStack> {
+        t.cost.iter().flatten().cloned().collect()
+    }
+
+    fn book(e: &[(&str, u32)]) -> ItemStack {
+        ItemStack::book_of(&e.iter().map(|(id, l)| ((*id).to_owned(), *l)).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn a_trade_can_ask_for_a_given_enchanted_book() {
+        let sharpness3 = book(&[("minecraft:sharpness", 3)]);
+        // Saved and read back, it keeps its enchantment.
+        let back = crate::stacks::decode_items(Some(&crate::stacks::encode_items(&[Some(sharpness3.clone())])), 1)[0].clone().unwrap();
+        assert_eq!(back.stored_enchantments(), vec![("minecraft:sharpness".to_owned(), 3)]);
+        assert_eq!(book_note(&sharpness3), "Sharpness III");
+        assert_eq!(book_note(&book(&[("minecraft:mending", 1), ("minecraft:fire_aspect", 2)])), "Fire Aspect II, Mending");
+        // That level or higher pays, with anything else on it; a lower level, another
+        // enchantment or a plain book doesn't.
+        assert!(pays(&book(&[("minecraft:sharpness", 3)]), &sharpness3));
+        assert!(pays(&book(&[("minecraft:sharpness", 5), ("minecraft:mending", 1)]), &sharpness3));
+        assert!(!pays(&book(&[("minecraft:sharpness", 2)]), &sharpness3));
+        assert!(!pays(&book(&[("minecraft:smite", 3)]), &sharpness3));
+        assert!(!pays(&st("minecraft:book", 1), &sharpness3));
+        // A book asking for nothing takes any enchanted book.
+        assert!(pays(&book(&[("minecraft:smite", 1)]), &st(BOOK, 1)));
+        // Put in a price slot, a book asks for its enchantments alone, not its repair cost.
+        let mut worn = book(&[("minecraft:mending", 1)]);
+        worn.extra.as_mut().unwrap().opaque_components.insert("minecraft:repair_cost".into(), mod_api::Tag::Int(3));
+        let asked = asked_for(worn.clone());
+        assert_eq!(asked, book(&[("minecraft:mending", 1)]));
+        assert!(pays(&worn, &asked));
+        // The player pays from the slot with a good book, and Joon gets that very book.
+        let t = tr(&[st("minecraft:emerald", 2), sharpness3.clone()], &[st("minecraft:diamond", 1)]);
+        let have = vec![
+            Some(book(&[("minecraft:sharpness", 1)])),
+            Some(st("minecraft:emerald", 5)),
+            Some(book(&[("minecraft:sharpness", 4), ("minecraft:looting", 2)])),
+        ];
+        let pay = payment(&have, &t).unwrap();
+        assert_eq!(pay, vec![(1, 2), (2, 1)]);
+        let paid = paid_stacks(&have, &pay);
+        assert_eq!(paid[1], book(&[("minecraft:sharpness", 4), ("minecraft:looting", 2)]));
+        let mut stock = vec![Some(st("minecraft:diamond", 3)), None, None];
+        assert_eq!(joon_side(&mut stock, &t, &paid, |_| 64), Ok(()));
+        assert!(stock.iter().flatten().any(|s| *s == paid[1]));
+        assert!(payment(&have[..2], &t).is_none());
+    }
+
     fn emeralds_for_bread() -> Trade {
         tr(&[st("minecraft:emerald", 2)], &[st("minecraft:bread", 6)])
     }
@@ -321,7 +475,7 @@ mod tests {
         stock[1] = Some(st("minecraft:apple", 5));
         // Eight loaves a trade: two from her 17; the apples allow two too.
         assert_eq!(stock_for(&stock, &t), Some(2));
-        assert_eq!(joon_side(&mut stock, &t, |_| 64), Ok(()));
+        assert_eq!(joon_side(&mut stock, &t, &costs(&t), |_| 64), Ok(()));
         assert_eq!(count_in(&stock, &st("minecraft:bread", 1)), 9);
         assert_eq!(count_in(&stock, &st("minecraft:apple", 1)), 3);
         assert_eq!(count_in(&stock, &st("minecraft:emerald", 1)), 4);
@@ -329,7 +483,7 @@ mod tests {
         assert_eq!(stock_for(&stock, &t), Some(1));
         stock[1] = Some(st("minecraft:apple", 1));
         assert!(!in_stock(&stock, &t));
-        assert_eq!(joon_side(&mut stock, &t, |_| 64), Err("out of stock"));
+        assert_eq!(joon_side(&mut stock, &t, &costs(&t), |_| 64), Err("out of stock"));
     }
 
     #[test]
@@ -350,12 +504,12 @@ mod tests {
         let t = emeralds_for_bread();
         assert!(in_stock(&stock, &t));
         assert_eq!(stock_for(&stock, &t), Some(1));
-        assert_eq!(joon_side(&mut stock, &t, |_| 64), Ok(()));
+        assert_eq!(joon_side(&mut stock, &t, &costs(&t), |_| 64), Ok(()));
         assert_eq!(count_in(&stock, &st("minecraft:bread", 1)), 4);
         assert_eq!(count_in(&stock, &st("minecraft:emerald", 1)), 2);
         // Four loaves left: not enough for six. Nothing changes.
         let before = stock.clone();
-        assert_eq!(joon_side(&mut stock, &t, |_| 64), Err("out of stock"));
+        assert_eq!(joon_side(&mut stock, &t, &costs(&t), |_| 64), Err("out of stock"));
         assert!(!in_stock(&stock, &t));
         assert_eq!(stock, before);
     }
@@ -366,11 +520,11 @@ mod tests {
         stock[0] = Some(st("minecraft:bread", 6));
         let t = emeralds_for_bread();
         // The bread's slot empties, so the emeralds go there.
-        assert_eq!(joon_side(&mut stock, &t, |_| 64), Ok(()));
+        assert_eq!(joon_side(&mut stock, &t, &costs(&t), |_| 64), Ok(()));
         stock[0] = Some(st("minecraft:dirt", 64));
         stock[1] = Some(st("minecraft:bread", 12));
         let before = stock.clone();
-        assert_eq!(joon_side(&mut stock, &t, |_| 64), Err("full"));
+        assert_eq!(joon_side(&mut stock, &t, &costs(&t), |_| 64), Err("full"));
         assert_eq!(stock, before);
     }
 
@@ -382,7 +536,7 @@ mod tests {
         assert!(can_pay(&[], &gift));
         assert!(in_stock(&[], &tip));
         let mut stock = vec![None; 3];
-        assert_eq!(joon_side(&mut stock, &tip, |_| 64), Ok(()));
+        assert_eq!(joon_side(&mut stock, &tip, &costs(&tip), |_| 64), Ok(()));
         assert_eq!(stock[0], Some(st("minecraft:emerald", 1)));
         assert_eq!(tip.face(), Some(&st("minecraft:emerald", 1)));
     }

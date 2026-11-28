@@ -630,6 +630,15 @@ fn item(host: &dyn ClientHost, d: &mut dyn DrawContext, s: &Shown, x: f32, y: f3
     }
 }
 
+/// `item`, and under the mouse what an enchanted book in it holds, after its name.
+#[allow(clippy::too_many_arguments)]
+fn noted_item(host: &dyn ClientHost, d: &mut dyn DrawContext, s: &Shown, note: &str, x: f32, y: f32, mouse: [f32; 2], tip: &mut Option<String>) {
+    item(host, d, s, x, y, mouse, tip);
+    if s.is_some() && !note.is_empty() && inside([x, y, 16.0, 16.0], mouse) {
+        *tip = Some(format!("{}: {note}", tip.take().unwrap_or_default()));
+    }
+}
+
 /// What trade `t` pays, and what it gives: the parts that are set, in order.
 fn paid(t: &ShownTrade) -> Vec<&Shown> {
     t.parts[..PAY].iter().filter(|s| s.is_some()).collect()
@@ -639,12 +648,22 @@ fn got(t: &ShownTrade) -> Vec<&Shown> {
     t.parts[PAY..].iter().filter(|s| s.is_some()).collect()
 }
 
+/// The parts of `t` in `range` that are set, each with its note.
+fn set_parts(t: &ShownTrade, range: std::ops::Range<usize>) -> Vec<(&Shown, &str)> {
+    range.filter(|&p| t.parts[p].is_some()).map(|p| (&t.parts[p], t.notes[p].as_str())).collect()
+}
+
+/// The enchanted books trade `t` asks for, as a player reads them: "Mending; Sharpness III".
+fn asks_note(t: &ShownTrade) -> String {
+    t.notes[..PAY].iter().filter(|n| !n.is_empty()).cloned().collect::<Vec<_>>().join("; ")
+}
+
 /// Trade `t` in the list of trades: the first thing paid and how many more, an arrow, the first
 /// thing got and how many more.
 fn trade_items(host: &dyn ClientHost, d: &mut dyn DrawContext, t: &ShownTrade, x: f32, y: f32, mouse: [f32; 2], tip: &mut Option<String>) {
     let (pay, get) = (paid(t), got(t));
-    if let Some(s) = pay.first() {
-        item(host, d, s, x, y, mouse, tip);
+    if let Some((s, note)) = set_parts(t, 0..PAY).first() {
+        noted_item(host, d, s, note, x, y, mouse, tip);
     }
     if pay.len() > 1 {
         label(d, &format!("+{}", pay.len() - 1), [x + 17.0, y + 4.0], DIM);
@@ -737,7 +756,7 @@ pub(crate) fn draw(host: &dyn ClientHost, d: &mut dyn DrawContext, window: Rect,
 fn draw_trades(host: &dyn ClientHost, d: &mut dyn DrawContext, v: &JoonView, o: [f32; 2], mouse: [f32; 2], (chosen, part, top): (usize, u8, usize), s: &Search, tip: &mut Option<String>) {
     label(d, "Joon's trades", [o[0] + 8.0, o[1] + 8.0], LABEL);
     right_label(d, "Click one to edit it", o[0] + PW - 8.0, o[1] + 8.0, DIM);
-    label(d, "Her trades", [o[0] + 8.0, o[1] + 20.0], DIM);
+    label(d, &format!("Her trades ({}/{MAX_TRADES})", v.trades.iter().filter(|t| t.parts.iter().any(Option::is_some)).count()), [o[0] + 8.0, o[1] + 20.0], DIM);
     let rows = trade_rows(v);
     for r in 0..TRADE_ROWS {
         let i = top + r;
@@ -778,7 +797,8 @@ fn draw_trades(host: &dyn ClientHost, d: &mut dyn DrawContext, v: &JoonView, o: 
             d.fill([r[0] + 1.0, r[1] + 1.0, 16.0, 16.0], 0x80FF_FFFF);
         }
         let s = part_of(t, p);
-        item(host, d, &s, r[0] + 1.0, r[1] + 1.0, mouse, tip);
+        let note = t.map_or("", |t| t.notes[usize::from(p)].as_str());
+        noted_item(host, d, &s, note, r[0] + 1.0, r[1] + 1.0, mouse, tip);
         if usize::from(p) >= PAY && s.is_some() && t.is_some_and(|t| t.stock == 0) {
             cross(d, r[0] + 1.0, r[1] + 1.0);
         }
@@ -811,6 +831,14 @@ fn draw_trades(host: &dyn ClientHost, d: &mut dyn DrawContext, v: &JoonView, o: 
     };
     let status = fit(d, &status, 108.0);
     label(d, &status, [o[0] + 140.0, o[1] + STATUS_Y], argb);
+    // The enchanted books it asks for, by name: the books all look alike.
+    if let Some(t) = t {
+        let asks = asks_note(t);
+        if !asks.is_empty() {
+            let asks = fit(d, &format!("Asks: {asks}"), 108.0);
+            label(d, &asks, [o[0] + 140.0, o[1] + STATUS_Y + 10.0], LABEL);
+        }
+    }
 
     // What to set the parts from: their own items, or any item in the game.
     for (all, name) in [(false, "Your items"), (true, "All items")] {
@@ -923,10 +951,26 @@ fn draw_send(d: &mut dyn DrawContext, v: &JoonView, o: [f32; 2], mouse: [f32; 2]
 
 fn draw_offer(host: &dyn ClientHost, d: &mut dyn DrawContext, v: &JoonView, o: [f32; 2], mouse: [f32; 2], top: usize, tip: &mut Option<String>) {
     panel(d, [o[0], o[1], PW, PH]);
-    let title = fit(d, &format!("Trade offer from {}", v.owner), PW - 60.0);
+    let title = match v.trades.len() {
+        n @ 2.. => format!("{n} trades from {}", v.owner),
+        _ => format!("Trade offer from {}", v.owner),
+    };
+    let title = fit(d, &title, PW - 60.0);
     label(d, &title, [o[0] + 8.0, o[1] + 8.0], LABEL);
     right_label(d, &clock(v.secs), o[0] + PW - 8.0, o[1] + 8.0, LABEL);
-    label(d, "Shift- or right-click Trade: trade all you can", [o[0] + 8.0, o[1] + 20.0], DIM);
+    // Over a trade that asks for enchanted books, the line says which: the books all look alike.
+    let asks = (0..OFFER_ROWS)
+        .find(|&r| inside(offer_rect(o, r), mouse))
+        .and_then(|r| v.trades.get(top + r))
+        .map(asks_note)
+        .filter(|n| !n.is_empty());
+    match asks {
+        Some(asks) => {
+            let line = fit(d, &format!("Asks for: {asks}"), PW - 16.0);
+            label(d, &line, [o[0] + 8.0, o[1] + 20.0], LABEL);
+        }
+        None => label(d, "Shift- or right-click Trade: trade all you can", [o[0] + 8.0, o[1] + 20.0], DIM),
+    }
     if v.trades.is_empty() {
         label(d, "She has nothing to trade", [o[0] + 12.0, o[1] + 36.0], DIM);
     }
@@ -936,11 +980,11 @@ fn draw_offer(host: &dyn ClientHost, d: &mut dyn DrawContext, v: &JoonView, o: [
         let rr = offer_rect(o, r);
         d.fill(rr, 0xFFB4_B4B4);
         // What is paid and what is got, each packed from the left of its side.
-        let (pay, get) = (paid(t), got(t));
-        for (k, s) in pay.iter().enumerate() {
+        let (pay, get) = (set_parts(t, 0..PAY), got(t));
+        for (k, (s, note)) in pay.iter().enumerate() {
             let r = offer_slot(rr, k);
             slot(d, r);
-            item(host, d, s, r[0] + 1.0, r[1] + 1.0, mouse, tip);
+            noted_item(host, d, s, note, r[0] + 1.0, r[1] + 1.0, mouse, tip);
         }
         if pay.is_empty() {
             label(d, "Free", [rr[0] + 8.0, rr[1] + 8.0], GREEN);
@@ -978,6 +1022,7 @@ mod tests {
                 parts: [Some(("minecraft:emerald".into(), 2)), None, None, None, Some(("minecraft:bread".into(), 6)), None, None, None],
                 stock: 3,
                 affordable: true,
+                notes: Default::default(),
             }],
             items: vec![Some(("minecraft:dirt".into(), 10)); 37],
             players: vec![ShownPlayer { uuid: 7, name: "Steve".into(), wait: 0, you: false }],

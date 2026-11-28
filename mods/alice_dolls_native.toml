@@ -25,6 +25,14 @@ categories = ["adventure", "mobs"]
 tags = ["touhou", "dolls", "companions", "automation"]
 
 [[versions]]
+version = "0.45.3"
+published = "2026-11-29"
+game = "26.3"
+file = "alice_dolls_native-0.45.3.hmod"
+sha256 = "2ad083e95f6bc61b06f5e47cd0c90a9cf799167e0c37f054be983959a04d11b3"
+changelog = "Joon's trades can ask for a given enchanted book: any enchanted book holding its enchantments, at that level or higher, pays, and her screens name the enchantments. Her Trades tab shows how many of her twelve trades are set. Needs the assets 0.17.0."
+
+[[versions]]
 version = "0.45.1"
 published = "2026-11-29"
 game = "26.3"

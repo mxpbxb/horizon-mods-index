@@ -43,6 +43,35 @@ impl DollStack {
         enchantments.get("levels").unwrap_or(enchantments).get(name).and_then(unsigned).unwrap_or(0)
     }
 
+    /// The enchantments an enchanted book holds (its `stored_enchantments`), each with its level,
+    /// sorted by id.
+    pub fn stored_enchantments(&self) -> Vec<(String, u32)> {
+        let Some(extra) = &self.extra else { return Vec::new() };
+        let Some(stored) = extra.opaque_components.get(&"minecraft:stored_enchantments".into()) else {
+            return Vec::new();
+        };
+        let Tag::Compound(levels) = stored.get("levels").unwrap_or(stored) else { return Vec::new() };
+        let mut out: Vec<(String, u32)> = levels
+            .iter()
+            .filter_map(|(id, level)| Some((id.to_string_lossy().to_string(), unsigned(level)?)))
+            .filter(|(_, level)| *level > 0)
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// An enchanted book holding just `enchantments`, as a Joon trade asks for it.
+    pub fn book_of(enchantments: &[(String, u32)]) -> Self {
+        let mut book = Self::new(crate::joon::BOOK, 1);
+        if !enchantments.is_empty() {
+            let levels: Compound = enchantments.iter().map(|(id, l)| (id.as_str().into(), Tag::Int(*l as i32))).collect();
+            let mut extra = StackData::default();
+            extra.opaque_components.insert("minecraft:stored_enchantments".into(), Tag::Compound(levels));
+            book.extra = Some(Box::new(extra));
+        }
+        book
+    }
+
     pub fn from_game(host: &dyn Host, stack: &ItemStack) -> Option<Self> {
         Self::decode(&Tag::Compound(stack.to_nbt(host)?))
     }

@@ -162,6 +162,7 @@ impl Mod {
             parts: t.parts().map(|s| shown(&s)),
             stock: joon::stock_for(&stock, t).unwrap_or(u32::MAX),
             affordable: joon::can_pay(&have, t),
+            notes: t.parts().map(|s| s.as_ref().map(joon::book_note).unwrap_or_default()),
         };
         match panel.view {
             View::Trade => {
@@ -264,6 +265,10 @@ impl Mod {
                 let Some(mut s) = host.player_stacks(player).get(usize::from(slot)).cloned().flatten() else { return };
                 let max = max_stack_size(host, &s.item).unwrap_or(64).clamp(1, 64);
                 s.count = if one { 1 } else { s.count.clamp(1, max) };
+                // A price slot asks for an enchanted book's enchantments, not that very book.
+                if usize::from(part) < joon::PAY {
+                    s = joon::asked_for(s);
+                }
                 let i = usize::from(trade);
                 if data.trades.len() <= i {
                     data.trades.resize(i + 1, Trade::default());
@@ -361,16 +366,19 @@ impl Mod {
         let mut stock = goals::inventory(doll).unwrap_or_else(|| data.items.clone());
         let (mut done, mut why) = (0, None);
         for _ in 0..rounds {
-            if !joon::can_pay(&host.player_stacks(player), t) {
+            let have = host.player_stacks(player);
+            let Some(payment) = joon::payment(&have, t) else {
                 why = Some("You haven't got what she asks for");
                 break;
-            }
+            };
+            // What she gets is what they gave: an enchanted book with all it holds.
+            let paid = joon::paid_stacks(&have, &payment);
             let mut after = stock.clone();
-            if let Err(e) = joon::joon_side(&mut after, t, |id| maxes.get(id).copied().unwrap_or(64)) {
+            if let Err(e) = joon::joon_side(&mut after, t, &paid, |id| maxes.get(id).copied().unwrap_or(64)) {
                 why = Some(if e == "full" { "Joon has no room for that" } else { "Joon is out of stock" });
                 break;
             }
-            if !costs.is_empty() && !host.take_stacks(player, &costs) {
+            if !costs.is_empty() && !host.take_from_slots(player, &payment, &have) {
                 why = Some("You haven't got what she asks for");
                 break;
             }
