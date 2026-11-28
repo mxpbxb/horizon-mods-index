@@ -25,6 +25,14 @@ categories = ["adventure", "mobs"]
 tags = ["touhou", "dolls", "companions", "automation"]
 
 [[versions]]
+version = "0.45.1"
+published = "2026-11-29"
+game = "26.3"
+file = "alice_dolls_native-0.45.1.hmod"
+sha256 = "3fdcd4a69c0aac69302241c8a4d6b99597a5c9963f02449d957526135476ee6c"
+changelog = "Dolls on Standby stay on the block where they were set to Standby, and are put back on it if knocked off; the block is saved with the doll. Needs the assets 0.17.0."
+
+[[versions]]
 version = "0.45.0"
 published = "2026-11-29"
 game = "26.3"

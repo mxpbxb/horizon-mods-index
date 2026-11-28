@@ -305,6 +305,8 @@ struct DollData {
     tag: u64,
     /// Joon's trades, as her owner set them.
     trades: Vec<joon::Trade>,
+    /// On standby, the block it keeps to: where it was when it was put on standby.
+    standby_at: Option<[i32; 3]>,
 }
 
 impl Default for DollData {
@@ -325,6 +327,7 @@ impl Default for DollData {
             giga: None,
             tag: 0,
             trades: Vec::new(),
+            standby_at: None,
         }
     }
 }
@@ -371,6 +374,9 @@ fn encode(data: &DollData) -> Result<Compound, AttachmentError> {
     }
     if !data.trades.is_empty() {
         tag.insert("Trades".into(), joon::encode_trades(&data.trades));
+    }
+    if let Some(s) = data.standby_at {
+        tag.insert("standby_at".into(), Tag::IntArray(s.to_vec()));
     }
     Ok(tag)
 }
@@ -435,6 +441,10 @@ fn decode(tag: &Compound) -> Result<DollData, AttachmentError> {
         },
         tag: long("doll_id").unwrap_or(0),
         trades: joon::decode_trades(tag.get(&"Trades".into())),
+        standby_at: match tag.get(&"standby_at".into()) {
+            Some(Tag::IntArray(v)) if v.len() == 3 => Some([v[0], v[1], v[2]]),
+            _ => None,
+        },
     };
     fit_baubles(&mut data);
     Ok(data)
@@ -699,6 +709,20 @@ fn dress(host: &mut dyn ServerHost, id: u32, doll: &Doll, items: &[Option<ItemSt
         }
     }
     DRESSED.lock().ok().map(|mut d| d.insert(id, (health.to_bits(), want)));
+}
+
+/// The block a doll in `mode` at `at` keeps to, having kept to `kept`: on standby the one it was on
+/// when it was put on standby, or the one it is on now when it was put somewhere else since (placed
+/// again, rung back with the bell); none in any other mode.
+fn standby_block(mode: u8, kept: Option<[i32; 3]>, at: [f64; 3]) -> Option<[i32; 3]> {
+    if mode != goals::STANDBY {
+        return None;
+    }
+    let here = [at[0].floor() as i32, (at[1] + 0.01).floor() as i32, at[2].floor() as i32];
+    match kept {
+        Some(b) if (0..3).map(|i| (at[i] - (f64::from(b[i]) + 0.5)).powi(2)).sum::<f64>() <= goals::STANDBY_MOVED.powi(2) => Some(b),
+        _ => Some(here),
+    }
 }
 
 /// Dolls whose `dress` write was refused, logged once each.
@@ -5203,7 +5227,14 @@ impl Hooks for Mod {
         {
             let dimension = level.dimension_id().to_owned();
             SEEN.lock().ok().map(|mut s| s.insert(id, Seen { dimension, at, mode: data.mode, enabled: data.enabled, when: Instant::now() }));
+            // Put on standby, it keeps to the block it is on; set to any other mode, it lets it go.
+            let block = standby_block(data.mode, data.standby_at, at);
+            if block != data.standby_at {
+                data.standby_at = block;
+                let _ = DOLL.set(host, holder, data.clone());
+            }
         }
+        goals::set_standby_at(id, if data.mode == goals::STANDBY { data.standby_at } else { None });
         let (level, into, need) = favour_level(data.favour);
         goals::set_level(id, level);
         if let Some(doll) = doll_of(host, id) {
@@ -5902,6 +5933,7 @@ mod tests {
             form_level: 3,
             giga: Some([-10, 63, 200]),
             tag: 77,
+            standby_at: Some([4, 70, -9]),
             trades: vec![joon::Trade::from_parts(vec![
                 Some(ItemStack::new("minecraft:emerald", 3)),
                 None,
@@ -5992,6 +6024,25 @@ mod tests {
         assert_eq!(health_tag(41, 72), "  HP 41/72");
         assert_eq!(health_tag(80, 72), "  HP 72/72");
         assert_eq!(health_tag(5, 0), "");
+    }
+
+    #[test]
+    fn a_doll_on_standby_keeps_to_its_block() {
+        // Put on standby: the block it stands on.
+        assert_eq!(standby_block(goals::STANDBY, None, [10.7, 64.0, -3.2]), Some([10, 64, -4]));
+        // Knocked a few blocks off: still its block.
+        assert_eq!(standby_block(goals::STANDBY, Some([10, 64, -4]), [13.0, 64.0, -4.0]), Some([10, 64, -4]));
+        // Placed again or rung back far off: the block it is on now.
+        assert_eq!(standby_block(goals::STANDBY, Some([10, 64, -4]), [40.5, 70.0, 0.5]), Some([40, 70, 0]));
+        // Any other mode lets it go.
+        assert_eq!(standby_block(goals::FOLLOW, Some([10, 64, -4]), [10.5, 64.0, -3.5]), None);
+        assert!(!goals::off_standby_block([10, 64, -4], [10.6, 64.0, -3.4]));
+        assert!(goals::off_standby_block([10, 64, -4], [11.2, 64.0, -3.5]));
+        assert!(goals::off_standby_block([10, 64, -4], [10.5, 65.5, -3.5]));
+        assert!(!goals::off_standby_block([10, 64, -4], [10.5, 61.0, -3.5]));
+        // It is saved with the doll.
+        let data = DollData { standby_at: Some([10, 64, -4]), ..DollData::default() };
+        assert_eq!(decode(&encode(&data).unwrap()).unwrap().standby_at, Some([10, 64, -4]));
     }
 
     #[test]

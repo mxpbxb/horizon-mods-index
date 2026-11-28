@@ -1429,6 +1429,33 @@ pub fn load_placed(text: &str) {
 /// The Horai dolls set, in their inventory screen, to keep the stone and earth they dig.
 pub static KEEP_ROCK: LazyLock<Mutex<HashSet<u32>>> = LazyLock::new(Default::default);
 
+/// The block each doll on standby keeps to: where it was when it was put on standby.
+static STANDBY_AT: LazyLock<Mutex<HashMap<u32, [i32; 3]>>> = LazyLock::new(Default::default);
+
+pub fn set_standby_at(id: u32, at: Option<[i32; 3]>) {
+    if let Ok(mut s) = STANDBY_AT.lock() {
+        match at {
+            Some(at) => s.insert(id, at),
+            None => s.remove(&id),
+        };
+    }
+}
+
+pub fn standby_at(id: u32) -> Option<[i32; 3]> {
+    STANDBY_AT.lock().ok()?.get(&id).copied()
+}
+
+/// How far a doll on standby may be put from its block (the bell, a new placing, a teleport) before
+/// the block it keeps to becomes the one it is on now: a knock or a push is never this far.
+pub const STANDBY_MOVED: f64 = 8.0;
+
+/// Whether a doll at `at` is off its standby block `block`: more than a third of a block from its
+/// middle across, or up off it (a fall down stays where it landed).
+pub fn off_standby_block(block: [i32; 3], at: [f64; 3]) -> bool {
+    let (dx, dz) = (at[0] - (f64::from(block[0]) + 0.5), at[2] - (f64::from(block[2]) + 0.5));
+    dx * dx + dz * dz > 0.3 * 0.3 || at[1] > f64::from(block[1]) + 1.0
+}
+
 pub fn set_keep_rock(id: u32, keep: bool) {
     if let Ok(mut k) = KEEP_ROCK.lock() {
         if keep {

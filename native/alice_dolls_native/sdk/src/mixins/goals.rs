@@ -388,6 +388,13 @@ fn tick_doll(m: &mut Mob, w: &MobWorld) {
     if state.mode == RIDE && state.enabled {
         sit_on_head(m, w);
     }
+    // On standby (its work AI on or off) it stays on the block where it was put on standby.
+    if state.mode == STANDBY
+        && !on_mission(m.id)
+        && let Some(block) = standby_at(m.id)
+    {
+        stand_by(m, block);
+    }
     // Its jobs are set once for each form: a doll that evolves (a Diamond Horai into a Netherite
     // one, a Goliath into a Netherite one) gets its new form's jobs, the quarry among them.
     let form = m.custom_name.clone().unwrap_or_default();
@@ -497,6 +504,24 @@ fn tick_doll(m: &mut Mob, w: &MobWorld) {
     ai.goals.add(13, goals::Stroll::new(1.0).gate(patrolling).named("DollWander"));
     ai.goals.add(14, goals::LookAtPlayer::new(8.0));
     ai.goals.add(16, goals::RandomLookAround::default());
+}
+
+/// Standby: before its goals each tick, a doll keeps to `block`. It can't walk (no speed, no path,
+/// nothing across), so no goal (a fight, a shot, picking things up, wandering) carries it off; it
+/// still turns to look and shoots from where it stands. Knocked or pushed off, it is put back on the
+/// middle of the block.
+fn stand_by(m: &mut Mob, block: [i32; 3]) {
+    m.attrs.speed = 0.0;
+    m.nav_stop();
+    m.velocity.x = 0.0;
+    m.velocity.z = 0.0;
+    if off_standby_block(block, [m.position.x, m.position.y, m.position.z]) {
+        m.position.x = f64::from(block[0]) + 0.5;
+        m.position.y = f64::from(block[1]);
+        m.position.z = f64::from(block[2]) + 0.5;
+        m.previous = m.position;
+        m.fall_distance = 0.0;
+    }
 }
 
 /// Wakasagi, a mermaid, swims as fast as a dolphin wherever her path leads in water: a walking mob
