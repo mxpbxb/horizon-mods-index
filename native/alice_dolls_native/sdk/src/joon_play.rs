@@ -96,13 +96,14 @@ fn shown(s: &Option<ItemStack>) -> net::Shown {
     s.as_ref().map(|s| (s.item.to_string(), s.count))
 }
 
-/// Part `part` of trade `t` (0 and 1 what is paid, 2 what is got).
+/// Part `part` of trade `t` (`0..PAY` what is paid, then what is got).
 fn part_mut(t: &mut Trade, part: u8) -> &mut Option<ItemStack> {
-    match part {
-        0 => &mut t.cost[0],
-        1 => &mut t.cost[1],
-        _ => &mut t.result,
-    }
+    let p = usize::from(part).min(joon::PARTS - 1);
+    t.part_mut(p).expect("a part under PARTS")
+}
+
+fn is_part(part: u8) -> bool {
+    usize::from(part) < joon::PARTS
 }
 
 /// The trades a visitor is offered: those that are set.
@@ -158,7 +159,7 @@ impl Mod {
         let stock = goals::inventory(panel.doll).unwrap_or_else(|| data.items.clone());
         let have = host.player_stacks(player);
         let show = |t: &Trade| ShownTrade {
-            parts: [shown(&t.cost[0]), shown(&t.cost[1]), shown(&t.result)],
+            parts: t.parts().map(|s| shown(&s)),
             stock: joon::stock_for(&stock, t).unwrap_or(u32::MAX),
             affordable: joon::can_pay(&have, t),
         };
@@ -259,7 +260,7 @@ impl Mod {
         let owner = panel.view == View::Edit;
         let mut changed = false;
         match act {
-            JoonAct::Set { trade, part, slot, one } if owner && usize::from(trade) < joon::MAX_TRADES && part < 3 => {
+            JoonAct::Set { trade, part, slot, one } if owner && usize::from(trade) < joon::MAX_TRADES && is_part(part) => {
                 let Some(mut s) = host.player_stacks(player).get(usize::from(slot)).cloned().flatten() else { return };
                 let max = max_stack_size(host, &s.item).unwrap_or(64).clamp(1, 64);
                 s.count = if one { 1 } else { s.count.clamp(1, max) };
@@ -270,7 +271,7 @@ impl Mod {
                 *part_mut(&mut data.trades[i], part) = Some(s);
                 changed = true;
             }
-            JoonAct::SetId { trade, part, ref id } if owner && usize::from(trade) < joon::MAX_TRADES && part < 3 => {
+            JoonAct::SetId { trade, part, ref id } if owner && usize::from(trade) < joon::MAX_TRADES && is_part(part) => {
                 // Any item the game has (not air), one of it.
                 if id == "minecraft:air" || max_stack_size(host, id).is_none() {
                     bar(host, player, format!("{} : I don't know the item {id}", goals::JOON));
@@ -283,7 +284,7 @@ impl Mod {
                 *part_mut(&mut data.trades[i], part) = Some(ItemStack::new(id.clone(), 1));
                 changed = true;
             }
-            JoonAct::Count { trade, part, count } if owner && part < 3 => {
+            JoonAct::Count { trade, part, count } if owner && is_part(part) => {
                 let Some(t) = data.trades.get_mut(usize::from(trade)) else { return };
                 let p = part_mut(t, part);
                 let Some(s) = p.as_mut() else { return };
@@ -374,8 +375,9 @@ impl Mod {
                 break;
             }
             stock = after;
-            if let Some(r) = &t.result {
-                crate::give_or_drop(host, &me, vec![r.clone()]);
+            let got: Vec<ItemStack> = t.result.iter().flatten().cloned().collect();
+            if !got.is_empty() {
+                crate::give_or_drop(host, &me, got);
             }
             done += 1;
         }

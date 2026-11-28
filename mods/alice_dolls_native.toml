@@ -25,6 +25,14 @@ categories = ["adventure", "mobs"]
 tags = ["touhou", "dolls", "companions", "automation"]
 
 [[versions]]
+version = "0.45.0"
+published = "2026-11-29"
+game = "26.3"
+file = "alice_dolls_native-0.45.0.hmod"
+sha256 = "985ce81757258438df8e68aea86c1f7e409abed2702f80490ff7242bc5a80d99"
+changelog = "Joon's trades each take up to four stacks and give up to four, all at once. A doll's armour-slot pieces now cut every blow, as a player's armour does. Love-level max health is kept on the doll and shown on its love meter. Needs the assets 0.17.0."
+
+[[versions]]
 version = "0.44.2"
 published = "2026-11-28"
 game = "26.3"

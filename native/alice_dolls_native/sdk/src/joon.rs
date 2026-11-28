@@ -19,23 +19,66 @@ pub const COOLDOWN_SECS: u64 = 300;
 /// Her storage: a large chest.
 pub const SLOTS: usize = 54;
 
-/// One trade: what the visited player pays (up to two stacks) and what they get.
+/// Stacks a trade takes, and stacks it gives.
+pub const PAY: usize = 4;
+pub const GET: usize = 4;
+/// A trade's parts, as the screen and its acts number them: what is paid first, then what is got.
+pub const PARTS: usize = PAY + GET;
+
+/// One trade: what the visited player pays (up to four stacks) and what they get (up to four).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Trade {
-    pub cost: [Option<ItemStack>; 2],
-    pub result: Option<ItemStack>,
+    pub cost: [Option<ItemStack>; PAY],
+    pub result: [Option<ItemStack>; GET],
 }
 
 impl Trade {
     pub fn is_set(&self) -> bool {
-        self.result.is_some() || self.cost.iter().any(Option::is_some)
+        self.result.iter().chain(&self.cost).any(Option::is_some)
     }
 
     /// What the player gets, or, for a trade that only takes, the first thing it takes: what the
     /// list of trades shows for it.
     pub fn face(&self) -> Option<&ItemStack> {
-        self.result.as_ref().or(self.cost[0].as_ref()).or(self.cost[1].as_ref())
+        self.result.iter().chain(&self.cost).flatten().next()
     }
+
+    /// Part `part` (`0..PAY` paid, then got).
+    pub fn part(&self, part: usize) -> Option<&ItemStack> {
+        if part < PAY { self.cost[part].as_ref() } else { self.result.get(part - PAY)?.as_ref() }
+    }
+
+    pub fn part_mut(&mut self, part: usize) -> Option<&mut Option<ItemStack>> {
+        if part < PAY { Some(&mut self.cost[part]) } else { self.result.get_mut(part - PAY) }
+    }
+
+    /// Every part, in order.
+    pub fn parts(&self) -> [Option<ItemStack>; PARTS] {
+        std::array::from_fn(|p| self.part(p).cloned())
+    }
+
+    pub fn from_parts(mut parts: Vec<Option<ItemStack>>) -> Trade {
+        parts.resize(PARTS, None);
+        let mut t = Trade::default();
+        for (p, s) in parts.into_iter().enumerate() {
+            if let Some(slot) = t.part_mut(p) {
+                *slot = s;
+            }
+        }
+        t
+    }
+}
+
+/// Stacks of the same item put together.
+fn summed<'a>(stacks: impl Iterator<Item = &'a ItemStack>) -> Vec<ItemStack> {
+    let mut out: Vec<ItemStack> = Vec::new();
+    for s in stacks {
+        match out.iter_mut().find(|n| same(n, s)) {
+            Some(n) => n.count += s.count,
+            None => out.push(s.clone()),
+        }
+    }
+    out
 }
 
 /// The same item: id, wear and components, whatever the count.
@@ -102,23 +145,22 @@ pub fn put_into(items: &mut [Option<ItemStack>], mut stack: ItemStack, max: u32)
 
 /// Whether her stock pays `trade` out once.
 pub fn in_stock(items: &[Option<ItemStack>], trade: &Trade) -> bool {
-    trade.result.as_ref().is_none_or(|r| count_in(items, r) >= r.count)
+    stock_for(items, trade).is_none_or(|n| n > 0)
 }
 
-/// How many times her stock pays `trade` out.
+/// How many times her stock pays `trade` out; None when it pays nothing out.
 pub fn stock_for(items: &[Option<ItemStack>], trade: &Trade) -> Option<u32> {
-    let r = trade.result.as_ref()?;
-    Some(count_in(items, r) / r.count.max(1))
+    summed(trade.result.iter().flatten()).iter().map(|r| count_in(items, r) / r.count.max(1)).min()
 }
 
 /// Her side of one trade: what it pays out comes out of `items` and what it takes goes in. `max`
 /// is an item's stack size. Unchanged, and Err with why, when it can't be done.
 pub fn joon_side(items: &mut [Option<ItemStack>], trade: &Trade, max: impl Fn(&str) -> u32) -> Result<(), &'static str> {
     let mut after = items.to_vec();
-    if let Some(r) = &trade.result
-        && !take_from(&mut after, r, r.count)
-    {
-        return Err("out of stock");
+    for r in summed(trade.result.iter().flatten()) {
+        if !take_from(&mut after, &r, r.count) {
+            return Err("out of stock");
+        }
     }
     for c in trade.cost.iter().flatten() {
         if put_into(&mut after, c.clone(), max(&c.item)).is_some() {
@@ -131,73 +173,92 @@ pub fn joon_side(items: &mut [Option<ItemStack>], trade: &Trade, max: impl Fn(&s
 
 /// Whether `have` (the player's inventory) holds what `trade` takes.
 pub fn can_pay(have: &[Option<ItemStack>], trade: &Trade) -> bool {
-    // Two costs of the same item take from the same stacks.
-    let mut need: Vec<ItemStack> = Vec::new();
-    for c in trade.cost.iter().flatten() {
-        match need.iter_mut().find(|n| same(n, c)) {
-            Some(n) => n.count += c.count,
-            None => need.push(c.clone()),
-        }
-    }
-    need.iter().all(|n| count_in(have, n) >= n.count)
+    // Costs of the same item take from the same stacks.
+    summed(trade.cost.iter().flatten()).iter().all(|n| count_in(have, n) >= n.count)
 }
 
 // ---- Saving ----
 
-/// Her trades as saved with her: a list of compounds, each its three stacks by slot (0 and 1 what
-/// it takes, 2 what it gives).
+/// The order a trade's parts are saved in: the three of the first trades (two paid, one got),
+/// where they always were, then the rest.
+const SAVED_ORDER: [usize; PARTS] = [0, 1, PAY, 2, 3, PAY + 1, PAY + 2, PAY + 3];
+/// Saved places a trade had before it had more parts.
+const OLD_PARTS: usize = 3;
+
+fn saved(t: &Trade) -> Vec<Option<ItemStack>> {
+    SAVED_ORDER.iter().map(|&p| t.part(p).cloned()).collect()
+}
+
+fn from_saved(mut s: Vec<Option<ItemStack>>) -> Trade {
+    s.resize(PARTS, None);
+    let mut parts = vec![None; PARTS];
+    for (k, stack) in s.into_iter().enumerate() {
+        parts[SAVED_ORDER[k]] = stack;
+    }
+    Trade::from_parts(parts)
+}
+
+/// Her trades as saved with her: a list of compounds, each its stacks by slot (`SAVED_ORDER`).
 pub fn encode_trades(trades: &[Trade]) -> Tag {
     Tag::List(
         trades
             .iter()
-            .map(|t| {
-                let slots = vec![t.cost[0].clone(), t.cost[1].clone(), t.result.clone()];
-                Tag::Compound([("Items".into(), crate::stacks::encode_items(&slots))].into())
-            })
+            .map(|t| Tag::Compound([("Items".into(), crate::stacks::encode_items(&saved(t)))].into()))
             .collect(),
     )
 }
 
 pub fn decode_trades(tag: Option<&Tag>) -> Vec<Trade> {
     let Some(Tag::List(list)) = tag else { return Vec::new() };
-    list.iter()
-        .take(MAX_TRADES)
-        .map(|t| {
-            let mut s = crate::stacks::decode_items(t.get("Items"), 3);
-            s.resize(3, None);
-            Trade { cost: [s[0].take(), s[1].take()], result: s[2].take() }
-        })
-        .collect()
+    list.iter().take(MAX_TRADES).map(|t| from_saved(crate::stacks::decode_items(t.get("Items"), PARTS))).collect()
 }
 
 /// Where a doll item keeps her trades, in its container: three slots a trade, past its baubles and
 /// before its favour.
 pub const TRADES_IN_ITEM: usize = 210;
+/// The rest of each trade's parts ride in one more stack's own container, here: the slots under
+/// 200 are her inventory's, and there is no room for them past it.
+pub const MORE_TRADES_IN_ITEM: u8 = (TRADES_IN_ITEM + MAX_TRADES * OLD_PARTS) as u8;
+const MORE: usize = PARTS - OLD_PARTS;
 
 /// Her trades, as her item carries them.
 pub fn trades_to_item(trades: &[Trade]) -> Vec<(u8, ItemStack)> {
     let mut out = Vec::new();
+    let mut more = Vec::new();
     for (i, t) in trades.iter().take(MAX_TRADES).enumerate() {
-        for (k, s) in [&t.cost[0], &t.cost[1], &t.result].into_iter().enumerate() {
-            if let Some(s) = s {
-                out.push(((TRADES_IN_ITEM + i * 3 + k) as u8, s.clone()));
+        for (k, s) in saved(t).into_iter().enumerate() {
+            let Some(s) = s else { continue };
+            if k < OLD_PARTS {
+                out.push(((TRADES_IN_ITEM + i * OLD_PARTS + k) as u8, s));
+            } else {
+                more.push(((i * MORE + k - OLD_PARTS) as u8, s));
             }
         }
+    }
+    if !more.is_empty() {
+        let mut holder = ItemStack::new("minecraft:paper", 1);
+        holder.extra = Some(Box::new(crate::stacks::StackData { container: more, ..Default::default() }));
+        out.push((MORE_TRADES_IN_ITEM, holder));
     }
     out
 }
 
 pub fn trades_from_item(container: &[(u8, ItemStack)]) -> Vec<Trade> {
-    let mut trades = vec![Trade::default(); MAX_TRADES];
+    let mut saved = vec![vec![None; PARTS]; MAX_TRADES];
     for (slot, s) in container {
-        let Some(at) = usize::from(*slot).checked_sub(TRADES_IN_ITEM).filter(|&a| a < MAX_TRADES * 3) else { continue };
-        let t = &mut trades[at / 3];
-        match at % 3 {
-            0 => t.cost[0] = Some(s.clone()),
-            1 => t.cost[1] = Some(s.clone()),
-            _ => t.result = Some(s.clone()),
+        if *slot == MORE_TRADES_IN_ITEM {
+            for (k, part) in s.container() {
+                let k = usize::from(*k);
+                if k < MAX_TRADES * MORE {
+                    saved[k / MORE][OLD_PARTS + k % MORE] = Some(part.clone());
+                }
+            }
+            continue;
         }
+        let Some(at) = usize::from(*slot).checked_sub(TRADES_IN_ITEM).filter(|&a| a < MAX_TRADES * OLD_PARTS) else { continue };
+        saved[at / OLD_PARTS][at % OLD_PARTS] = Some(s.clone());
     }
+    let mut trades: Vec<Trade> = saved.into_iter().map(from_saved).collect();
     while trades.last().is_some_and(|t| !t.is_set()) {
         trades.pop();
     }
@@ -230,8 +291,56 @@ mod tests {
         ItemStack::new(id, n)
     }
 
+    /// A trade of what is paid for what is got.
+    fn tr(pay: &[ItemStack], get: &[ItemStack]) -> Trade {
+        let mut t = Trade::default();
+        for (k, s) in pay.iter().enumerate() {
+            t.cost[k] = Some(s.clone());
+        }
+        for (k, s) in get.iter().enumerate() {
+            t.result[k] = Some(s.clone());
+        }
+        t
+    }
+
     fn emeralds_for_bread() -> Trade {
-        Trade { cost: [Some(st("minecraft:emerald", 2)), None], result: Some(st("minecraft:bread", 6)) }
+        tr(&[st("minecraft:emerald", 2)], &[st("minecraft:bread", 6)])
+    }
+
+    #[test]
+    fn a_trade_takes_and_gives_several_stacks_at_once() {
+        let t = tr(
+            &[st("minecraft:emerald", 3), st("minecraft:gold_ingot", 2), st("minecraft:emerald", 1)],
+            &[st("minecraft:bread", 6), st("minecraft:apple", 2), st("minecraft:bread", 2)],
+        );
+        // The two emerald costs are paid from the same stacks.
+        assert!(!can_pay(&[Some(st("minecraft:emerald", 3)), Some(st("minecraft:gold_ingot", 2))], &t));
+        assert!(can_pay(&[Some(st("minecraft:emerald", 4)), Some(st("minecraft:gold_ingot", 2))], &t));
+        let mut stock = vec![None; 6];
+        stock[0] = Some(st("minecraft:bread", 17));
+        stock[1] = Some(st("minecraft:apple", 5));
+        // Eight loaves a trade: two from her 17; the apples allow two too.
+        assert_eq!(stock_for(&stock, &t), Some(2));
+        assert_eq!(joon_side(&mut stock, &t, |_| 64), Ok(()));
+        assert_eq!(count_in(&stock, &st("minecraft:bread", 1)), 9);
+        assert_eq!(count_in(&stock, &st("minecraft:apple", 1)), 3);
+        assert_eq!(count_in(&stock, &st("minecraft:emerald", 1)), 4);
+        assert_eq!(count_in(&stock, &st("minecraft:gold_ingot", 1)), 2);
+        assert_eq!(stock_for(&stock, &t), Some(1));
+        stock[1] = Some(st("minecraft:apple", 1));
+        assert!(!in_stock(&stock, &t));
+        assert_eq!(joon_side(&mut stock, &t, |_| 64), Err("out of stock"));
+    }
+
+    #[test]
+    fn a_trade_saved_before_it_had_more_parts_reads_back() {
+        // 0.44.2's item: three slots a trade from 210, nothing more.
+        let old = vec![(210u8, st("minecraft:emerald", 2)), (212u8, st("minecraft:bread", 6)), (215u8, st("minecraft:cake", 1))];
+        assert_eq!(trades_from_item(&old), vec![emeralds_for_bread(), tr(&[], &[st("minecraft:cake", 1)])]);
+        let old_tag = Tag::List(vec![Tag::Compound(
+            [("Items".into(), crate::stacks::encode_items(&[Some(st("minecraft:emerald", 2)), None, Some(st("minecraft:bread", 6))]))].into(),
+        )]);
+        assert_eq!(decode_trades(Some(&old_tag)), vec![emeralds_for_bread()]);
     }
 
     #[test]
@@ -267,8 +376,8 @@ mod tests {
 
     #[test]
     fn gifts_either_way() {
-        let gift = Trade { cost: [None, None], result: Some(st("minecraft:cake", 1)) };
-        let tip = Trade { cost: [Some(st("minecraft:emerald", 1)), None], result: None };
+        let gift = tr(&[], &[st("minecraft:cake", 1)]);
+        let tip = tr(&[st("minecraft:emerald", 1)], &[]);
         assert!(gift.is_set() && tip.is_set() && !Trade::default().is_set());
         assert!(can_pay(&[], &gift));
         assert!(in_stock(&[], &tip));
@@ -280,7 +389,7 @@ mod tests {
 
     #[test]
     fn the_player_pays_both_costs_of_one_item_from_the_same_stacks() {
-        let t = Trade { cost: [Some(st("minecraft:emerald", 40)), Some(st("minecraft:emerald", 30))], result: None };
+        let t = tr(&[st("minecraft:emerald", 40), st("minecraft:emerald", 30)], &[]);
         assert!(!can_pay(&[Some(st("minecraft:emerald", 64))], &t));
         assert!(can_pay(&[Some(st("minecraft:emerald", 64)), Some(st("minecraft:emerald", 6))], &t));
     }
@@ -295,11 +404,17 @@ mod tests {
 
     #[test]
     fn her_trades_are_saved_with_her_and_in_her_item() {
-        let trades = vec![emeralds_for_bread(), Trade::default(), Trade { cost: [None, Some(st("minecraft:diamond", 1))], result: None }];
+        let full = Trade::from_parts((0..PARTS).map(|p| Some(st("minecraft:dirt", p as u32 + 1))).collect());
+        let mut diamond = Trade::default();
+        diamond.cost[1] = Some(st("minecraft:diamond", 1));
+        let trades = vec![emeralds_for_bread(), Trade::default(), diamond, full];
         let back = decode_trades(Some(&encode_trades(&trades)));
         assert_eq!(back, trades);
         let in_item = trades_to_item(&trades);
         assert!(in_item.iter().all(|(s, _)| (210..250).contains(s)));
+        let mut twelve = vec![trades[3].clone(); MAX_TRADES];
+        twelve[11] = emeralds_for_bread();
+        assert_eq!(trades_from_item(&trades_to_item(&twelve)), twelve);
         assert_eq!(trades_from_item(&in_item), trades);
         assert_eq!(trades_from_item(&[]), Vec::new());
         assert_eq!(decode_trades(None), Vec::new());

@@ -8,7 +8,7 @@ use std::sync::Mutex;
 
 use mod_api::{ClientHost, DrawContext, Text};
 
-use crate::joon::{MAX_TRADES, clock};
+use crate::joon::{MAX_TRADES, PARTS, PAY, clock};
 use crate::net::{JoonAct, JoonView, Shown, ShownTrade};
 use crate::stacks::DollStack;
 
@@ -34,7 +34,7 @@ struct Ui {
     /// The server closed it (or it was left for her stock).
     want_close: bool,
     tab: Tab,
-    /// The trade being edited, and which of its parts (0 and 1 what is paid, 2 what is got).
+    /// The trade being edited, and which of its parts (`0..PAY` what is paid, then what is got).
     chosen: usize,
     part: u8,
     /// First rows shown of each list.
@@ -221,13 +221,26 @@ fn row_rect(o: [f32; 2], r: usize) -> Rect {
     at(o, 8.0, 30.0 + 18.0 * r as f32, 116.0, 18.0)
 }
 
-/// A trade part's slot on the Trades tab.
+/// A trade part's slot on the Trades tab: what is paid two by two on the left, what is got two by
+/// two on the right.
 fn part_rect(o: [f32; 2], part: u8) -> Rect {
-    match part {
-        0 => at(o, 140.0, 31.0, 18.0, 18.0),
-        1 => at(o, 160.0, 31.0, 18.0, 18.0),
-        _ => at(o, 210.0, 31.0, 18.0, 18.0),
-    }
+    let p = usize::from(part);
+    let (x, k) = if p < PAY { (140.0, p) } else { (196.0, p - PAY) };
+    at(o, x + 18.0 * (k % 2) as f32, 31.0 + 18.0 * (k / 2) as f32, 18.0, 18.0)
+}
+
+/// The rows under the parts: a part's count, the trade's delete, and what it says.
+const COUNT_Y: f32 = 72.0;
+const DELETE_Y: f32 = 92.0;
+const STATUS_Y: f32 = 112.0;
+
+fn parts_range() -> std::ops::Range<u8> {
+    0..PARTS as u8
+}
+
+/// The part after `part` that is empty, round to the start: where the next item goes.
+fn next_empty(t: Option<&ShownTrade>, part: u8) -> Option<u8> {
+    (1..PARTS as u8).map(|k| (part + k) % PARTS as u8).find(|&p| part_of(t, p).is_none())
 }
 
 /// The player's slot `i` (`JoonView::items`): their inventory as their own screen lays it out,
@@ -249,7 +262,13 @@ fn offer_rect(o: [f32; 2], r: usize) -> Rect {
 }
 
 fn offer_button(row: Rect) -> Rect {
-    [row[0] + row[2] - 82.0, row[1] + 4.0, 78.0, 16.0]
+    [row[0] + row[2] - 66.0, row[1] + 4.0, 64.0, 16.0]
+}
+
+/// An offer row's slot for part `part`: what is paid, an arrow, what is got.
+fn offer_slot(row: Rect, part: usize) -> Rect {
+    let x = if part < PAY { 3.0 + 18.0 * part as f32 } else { 96.0 + 18.0 * (part - PAY) as f32 };
+    [row[0] + x, row[1] + 3.0, 18.0, 18.0]
 }
 
 /// The trades the owner's list shows: hers, and a row for a new one while there is room.
@@ -285,13 +304,13 @@ fn hits(v: &JoonView, ui: &Ui, o: [f32; 2]) -> Vec<(Rect, Hit)> {
                 }
             }
             out.push((at(o, 8.0, 30.0, 122.0, 18.0 * TRADE_ROWS as f32), Hit::TradesList));
-            for p in 0..3 {
+            for p in parts_range() {
                 out.push((part_rect(o, p), Hit::Part(p)));
             }
-            out.push((at(o, 140.0, 56.0, 16.0, 16.0), Hit::Minus));
-            out.push((at(o, 192.0, 56.0, 16.0, 16.0), Hit::Plus));
-            out.push((at(o, 212.0, 56.0, 36.0, 16.0), Hit::Clear));
-            out.push((at(o, 140.0, 76.0, 108.0, 16.0), Hit::Delete));
+            out.push((at(o, 140.0, COUNT_Y, 16.0, 16.0), Hit::Minus));
+            out.push((at(o, 192.0, COUNT_Y, 16.0, 16.0), Hit::Plus));
+            out.push((at(o, 212.0, COUNT_Y, 36.0, 16.0), Hit::Clear));
+            out.push((at(o, 140.0, DELETE_Y, 108.0, 16.0), Hit::Delete));
             out.push((at(o, 176.0, 132.0, 72.0, 20.0), Hit::Stock));
             out.push((mode_rect(o, false), Hit::Mode(false)));
             out.push((mode_rect(o, true), Hit::Mode(true)));
@@ -373,7 +392,7 @@ pub(crate) fn pressed(window: Rect, mouse: [f32; 2], button: i32, shift: bool) {
             Hit::Item(slot) if v.items.get(usize::from(slot)).is_some_and(Option::is_some) => {
                 let act = JoonAct::Set { trade, part: ui.part, slot, one: right };
                 // On to the next empty part, as filling a trade in goes.
-                if let Some(next) = (0..3u8).find(|&p| p != ui.part && part_of(t, p).is_none()) {
+                if let Some(next) = next_empty(t, ui.part) {
                     ui.part = next;
                 }
                 Some(act)
@@ -418,7 +437,7 @@ pub(crate) fn scrolled(window: Rect, mouse: [f32; 2], by: f64) {
             *top = if up { top.saturating_sub(1) } else { (*top + 1).min(max) };
         };
         // Over a part's slot the wheel counts it up and down.
-        let over_part = (0..3u8).find(|&p| !v.visitor && ui.tab == Tab::Trades && inside(part_rect(o, p), mouse));
+        let over_part = parts_range().find(|&p| !v.visitor && ui.tab == Tab::Trades && inside(part_rect(o, p), mouse));
         if let Some(p) = over_part {
             let n = part_of(v.trades.get(ui.chosen), p).map_or(0, |(_, n)| n);
             if n > 0 {
@@ -442,7 +461,7 @@ pub(crate) fn scrolled(window: Rect, mouse: [f32; 2], by: f64) {
 /// The chosen part set to item `id` (one of it), and on to the next empty part.
 fn pick(ui: &mut Ui, t: Option<&ShownTrade>, trade: u8, id: String) -> Option<JoonAct> {
     let act = JoonAct::SetId { trade, part: ui.part, id };
-    if let Some(next) = (0..3u8).find(|&p| p != ui.part && part_of(t, p).is_none()) {
+    if let Some(next) = next_empty(t, ui.part) {
         ui.part = next;
     }
     Some(act)
@@ -611,14 +630,34 @@ fn item(host: &dyn ClientHost, d: &mut dyn DrawContext, s: &Shown, x: f32, y: f3
     }
 }
 
-/// The three parts of trade `t` as a row: what is paid, an arrow, what is got.
+/// What trade `t` pays, and what it gives: the parts that are set, in order.
+fn paid(t: &ShownTrade) -> Vec<&Shown> {
+    t.parts[..PAY].iter().filter(|s| s.is_some()).collect()
+}
+
+fn got(t: &ShownTrade) -> Vec<&Shown> {
+    t.parts[PAY..].iter().filter(|s| s.is_some()).collect()
+}
+
+/// Trade `t` in the list of trades: the first thing paid and how many more, an arrow, the first
+/// thing got and how many more.
 fn trade_items(host: &dyn ClientHost, d: &mut dyn DrawContext, t: &ShownTrade, x: f32, y: f32, mouse: [f32; 2], tip: &mut Option<String>) {
-    item(host, d, &t.parts[0], x, y, mouse, tip);
-    item(host, d, &t.parts[1], x + 18.0, y, mouse, tip);
-    arrow(d, x + 37.0, y + 8.0);
-    item(host, d, &t.parts[2], x + 54.0, y, mouse, tip);
-    if t.parts[2].is_some() && t.stock == 0 {
-        cross(d, x + 54.0, y);
+    let (pay, get) = (paid(t), got(t));
+    if let Some(s) = pay.first() {
+        item(host, d, s, x, y, mouse, tip);
+    }
+    if pay.len() > 1 {
+        label(d, &format!("+{}", pay.len() - 1), [x + 17.0, y + 4.0], DIM);
+    }
+    arrow(d, x + 30.0, y + 8.0);
+    if let Some(s) = get.first() {
+        item(host, d, s, x + 48.0, y, mouse, tip);
+        if t.stock == 0 {
+            cross(d, x + 48.0, y);
+        }
+    }
+    if get.len() > 1 {
+        label(d, &format!("+{}", get.len() - 1), [x + 65.0, y + 4.0], DIM);
     }
 }
 
@@ -731,8 +770,8 @@ fn draw_trades(host: &dyn ClientHost, d: &mut dyn DrawContext, v: &JoonView, o: 
     // The trade being edited.
     let t = v.trades.get(chosen);
     label(d, "They pay", [o[0] + 140.0, o[1] + 20.0], DIM);
-    label(d, "They get", [o[0] + 206.0, o[1] + 20.0], DIM);
-    for p in 0..3u8 {
+    label(d, "They get", [o[0] + 196.0, o[1] + 20.0], DIM);
+    for p in parts_range() {
         let r = part_rect(o, p);
         slot(d, r);
         if inside(r, mouse) {
@@ -740,7 +779,7 @@ fn draw_trades(host: &dyn ClientHost, d: &mut dyn DrawContext, v: &JoonView, o: 
         }
         let s = part_of(t, p);
         item(host, d, &s, r[0] + 1.0, r[1] + 1.0, mouse, tip);
-        if p == 2 && s.is_some() && t.is_some_and(|t| t.stock == 0) {
+        if usize::from(p) >= PAY && s.is_some() && t.is_some_and(|t| t.stock == 0) {
             cross(d, r[0] + 1.0, r[1] + 1.0);
         }
         if p == part {
@@ -752,26 +791,26 @@ fn draw_trades(host: &dyn ClientHost, d: &mut dyn DrawContext, v: &JoonView, o: 
             d.fill([r[0] + r[2], r[1] - 1.0, 1.0, r[3] + 2.0], c);
         }
     }
-    arrow(d, o[0] + 186.0, o[1] + 40.0);
+    arrow(d, o[0] + 178.0, o[1] + 49.0);
     let n = part_of(t, part).map_or(0, |(_, n)| n);
-    button(d, at(o, 140.0, 56.0, 16.0, 16.0), "-", mouse, n > 1);
-    let field = at(o, 158.0, 56.0, 32.0, 16.0);
+    button(d, at(o, 140.0, COUNT_Y, 16.0, 16.0), "-", mouse, n > 1);
+    let field = at(o, 158.0, COUNT_Y, 32.0, 16.0);
     d.fill(field, 0xFFA0_A0A0);
     d.fill([field[0] + 1.0, field[1] + 1.0, field[2] - 2.0, field[3] - 2.0], 0xFF00_0000);
     let count = if n > 0 { n.to_string() } else { "-".to_owned() };
     let w = d.text_width(&count);
     d.text(&count, [(field[0] + (field[2] - w) / 2.0).floor(), field[1] + 4.0], 0xFFE0_E0E0, true);
-    button(d, at(o, 192.0, 56.0, 16.0, 16.0), "+", mouse, n > 0 && n < 64);
-    button(d, at(o, 212.0, 56.0, 36.0, 16.0), "Clear", mouse, n > 0);
-    button(d, at(o, 140.0, 76.0, 108.0, 16.0), "Delete trade", mouse, chosen < v.trades.len());
+    button(d, at(o, 192.0, COUNT_Y, 16.0, 16.0), "+", mouse, n > 0 && n < 64);
+    button(d, at(o, 212.0, COUNT_Y, 36.0, 16.0), "Clear", mouse, n > 0);
+    button(d, at(o, 140.0, DELETE_Y, 108.0, 16.0), "Delete trade", mouse, chosen < v.trades.len());
     let (status, argb) = match t.filter(|t| t.parts.iter().any(Option::is_some)) {
         None => ("Pick a slot, then an item".to_owned(), DIM),
-        Some(t) if t.parts[2].is_none() => ("They get nothing: a gift".to_owned(), DIM),
+        Some(t) if got(t).is_empty() => ("They get nothing: a gift".to_owned(), DIM),
         Some(t) if t.stock == 0 => ("Out of stock".to_owned(), RED),
         Some(t) => (format!("In stock for {} trades", t.stock.min(9999)), GREEN),
     };
     let status = fit(d, &status, 108.0);
-    label(d, &status, [o[0] + 140.0, o[1] + 98.0], argb);
+    label(d, &status, [o[0] + 140.0, o[1] + STATUS_Y], argb);
 
     // What to set the parts from: their own items, or any item in the game.
     for (all, name) in [(false, "Your items"), (true, "All items")] {
@@ -896,23 +935,27 @@ fn draw_offer(host: &dyn ClientHost, d: &mut dyn DrawContext, v: &JoonView, o: [
         let Some(t) = v.trades.get(i) else { break };
         let rr = offer_rect(o, r);
         d.fill(rr, 0xFFB4_B4B4);
-        for k in 0..3 {
-            let x = rr[0] + 3.0 + [0.0, 20.0, 60.0][k];
-            slot(d, [x, rr[1] + 3.0, 18.0, 18.0]);
+        // What is paid and what is got, each packed from the left of its side.
+        let (pay, get) = (paid(t), got(t));
+        for (k, s) in pay.iter().enumerate() {
+            let r = offer_slot(rr, k);
+            slot(d, r);
+            item(host, d, s, r[0] + 1.0, r[1] + 1.0, mouse, tip);
         }
-        let shown = ShownTrade { parts: t.parts.clone(), ..t.clone() };
-        item(host, d, &shown.parts[0], rr[0] + 4.0, rr[1] + 4.0, mouse, tip);
-        item(host, d, &shown.parts[1], rr[0] + 24.0, rr[1] + 4.0, mouse, tip);
-        arrow(d, rr[0] + 44.0, rr[1] + 12.0);
-        item(host, d, &shown.parts[2], rr[0] + 64.0, rr[1] + 4.0, mouse, tip);
-        if t.parts[2].is_some() && t.stock == 0 {
-            cross(d, rr[0] + 64.0, rr[1] + 4.0);
+        if pay.is_empty() {
+            label(d, "Free", [rr[0] + 8.0, rr[1] + 8.0], GREEN);
         }
-        if t.parts[0].is_none() && t.parts[1].is_none() {
-            label(d, "Free", [rr[0] + 86.0, rr[1] + 8.0], GREEN);
+        arrow(d, rr[0] + 77.0, rr[1] + 12.0);
+        for (k, s) in get.iter().enumerate() {
+            let r = offer_slot(rr, PAY + k);
+            slot(d, r);
+            item(host, d, s, r[0] + 1.0, r[1] + 1.0, mouse, tip);
+            if t.stock == 0 {
+                cross(d, r[0] + 1.0, r[1] + 1.0);
+            }
         }
         let (text, enabled) = if t.stock == 0 {
-            ("Out of stock", false)
+            ("No stock", false)
         } else if !t.affordable {
             ("Can't pay", false)
         } else {
@@ -931,7 +974,11 @@ mod tests {
 
     fn owner_view() -> JoonView {
         JoonView {
-            trades: vec![ShownTrade { parts: [Some(("minecraft:emerald".into(), 2)), None, Some(("minecraft:bread".into(), 6))], stock: 3, affordable: true }],
+            trades: vec![ShownTrade {
+                parts: [Some(("minecraft:emerald".into(), 2)), None, None, None, Some(("minecraft:bread".into(), 6)), None, None, None],
+                stock: 3,
+                affordable: true,
+            }],
             items: vec![Some(("minecraft:dirt".into(), 10)); 37],
             players: vec![ShownPlayer { uuid: 7, name: "Steve".into(), wait: 0, you: false }],
             ..JoonView::default()

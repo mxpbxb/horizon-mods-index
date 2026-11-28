@@ -661,34 +661,107 @@ const WORN: [mod_api::EquipmentSlot; 4] =
 /// A doll's level and armour, on the doll mob itself (as `goals::wear_armour` and the levelled
 /// health of the pre-SDK mod did): its max health grows with its love level (a doll gets the new
 /// health in full), and what is in its armour slots, each only when it is that piece, is worn as its
-/// equipment, so it counts against every blow. Only what changed is written.
+/// equipment, so it counts against every blow.
+///
+/// What the doll mob really has is read back every time, never taken from what was last written:
+/// a write made before the mob was ready, or anything that puts the type's max health back or
+/// clears its equipment (a reload, a merge of its data), is put right on the next tick.
 fn dress(host: &mut dyn ServerHost, id: u32, doll: &Doll, items: &[Option<ItemStack>], level: u32) {
+    let want = worn_wanted(doll, items);
+    let health = goals::levelled_health(health_of(doll), level);
+    let had = DRESSED.lock().ok().and_then(|d| d.get(&id).cloned());
+    let Some(living) = host.entity(id).and_then(|e| host.living(e)) else { return };
+    // The mob's own maximum, which its hits and healing go by. Not the attribute map's base: the
+    // doll's type has no row in the game's attribute catalog, so that read always comes back empty.
+    let max = living.max_health(host).map(f64::from);
+    if max.is_none_or(|m| (m - f64::from(health)).abs() > 1e-3) {
+        let ok = living.set_attribute_base(host, "minecraft:max_health", f64::from(health));
+        // Its new health in full when its maximum is new to it (a level, a new form, just placed);
+        // a maximum only put back (something reset it) heals nothing; never more than it.
+        let now = living.health(host).unwrap_or(health);
+        let new = had.as_ref().is_none_or(|(h, _)| *h != health.to_bits());
+        if ok && (new || now > health) {
+            living.set_health(host, health);
+        }
+        if !ok && first_time(&DRESS_FAILED, id) {
+            debug(host, &format!("dress {id}: max health {health} was refused"));
+        }
+    }
+    for (part, slot) in WORN.into_iter().enumerate() {
+        let worn = living.equipment(host, slot).and_then(|s| ItemStack::from_game(host, &s));
+        let changed = had.as_ref().is_some_and(|(_, w)| w[part] != want[part]);
+        if !changed && same_piece(worn.as_ref(), want[part].as_ref()) {
+            continue;
+        }
+        let stack = want[part].as_ref().and_then(|s| s.to_game(host));
+        if !matches!(living.set_equipment(host, slot, stack), Ok(true)) && first_time(&DRESS_FAILED, id) {
+            debug(host, &format!("dress {id}: armour part {part} was refused"));
+        }
+    }
+    DRESSED.lock().ok().map(|mut d| d.insert(id, (health.to_bits(), want)));
+}
+
+/// Dolls whose `dress` write was refused, logged once each.
+static DRESS_FAILED: LazyLock<Mutex<std::collections::HashSet<u32>>> = LazyLock::new(Default::default);
+
+/// What a doll wears, helmet to boots: what is in each of its armour slots, when it is that piece.
+fn worn_wanted(doll: &Doll, items: &[Option<ItemStack>]) -> [Option<ItemStack>; 4] {
     let n = items.len();
-    let want: [Option<ItemStack>; 4] = std::array::from_fn(|part| {
+    std::array::from_fn(|part| {
         if n < goals::ARMOUR_SLOTS || doll.name == goals::JOON {
             return None;
         }
         items[goals::armour_slot(n, part)].clone().filter(|s| goals::armour_part(&s.item) == Some(part))
-    });
-    let health = goals::levelled_health(health_of(doll), level);
-    let had = DRESSED.lock().ok().and_then(|d| d.get(&id).cloned());
-    if had.as_ref().is_some_and(|(h, w)| *h == health.to_bits() && *w == want) {
-        return;
+    })
+}
+
+/// The armour and toughness of a doll's worn pieces, helmet to boots, as vanilla's armour items
+/// give them; another mod's piece counts as iron.
+fn armour_of(worn: &[Option<ItemStack>; 4]) -> (f32, f32) {
+    worn.iter().enumerate().fold((0.0, 0.0), |(a, t), (part, s)| {
+        let Some(s) = s else { return (a, t) };
+        let name = s.item.strip_prefix("minecraft:").unwrap_or(&s.item);
+        let material = name.rsplit_once('_').map_or(name, |m| m.0);
+        let (points, toughness): ([f32; 4], f32) = match material {
+            "leather" => ([1.0, 3.0, 2.0, 1.0], 0.0),
+            "chainmail" => ([2.0, 5.0, 4.0, 1.0], 0.0),
+            "golden" => ([2.0, 5.0, 3.0, 1.0], 0.0),
+            "copper" => ([2.0, 4.0, 3.0, 1.0], 0.0),
+            "diamond" => ([3.0, 8.0, 6.0, 3.0], 2.0),
+            "netherite" => ([3.0, 8.0, 6.0, 3.0], 3.0),
+            "turtle" => ([2.0, 0.0, 0.0, 0.0], 0.0),
+            _ => ([2.0, 6.0, 5.0, 2.0], 0.0),
+        };
+        (a + points[part], t + toughness)
+    })
+}
+
+/// `CombatRules.getDamageAfterAbsorb`: armour takes up to four fifths of a blow, less of a heavy
+/// one, and toughness keeps more of it against heavy ones.
+fn damage_after_armour(damage: f32, armour: f32, toughness: f32) -> f32 {
+    let f = 2.0 + toughness / 4.0;
+    let share = (armour - damage / f).clamp(armour * 0.2, 20.0) / 25.0;
+    damage * (1.0 - share)
+}
+
+/// The harm no armour turns aside (vanilla's `bypasses_armor` damage types).
+fn armour_bypassed(damage_type: &str) -> bool {
+    matches!(
+        damage_type.strip_prefix("minecraft:").unwrap_or(damage_type),
+        "on_fire" | "in_wall" | "cramming" | "drown" | "fly_into_wall" | "generic" | "wither" | "dragon_breath"
+            | "starve" | "fall" | "freeze" | "stalagmite" | "magic" | "indirect_magic" | "out_of_world"
+            | "generic_kill" | "sonic_boom" | "outside_border"
+    )
+}
+
+/// Whether the piece worn is the one wanted: the same item. Its wear from blows is its own, so a
+/// worn piece is not put back to the slot's copy on every hit.
+fn same_piece(worn: Option<&ItemStack>, want: Option<&ItemStack>) -> bool {
+    match (worn, want) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.item == b.item,
+        _ => false,
     }
-    let Some(living) = host.entity(id).and_then(|e| host.living(e)) else { return };
-    let base = living.attribute_base(host, "minecraft:max_health");
-    if base.is_none_or(|b| (b - f64::from(health)).abs() > 1e-3) {
-        living.set_attribute_base(host, "minecraft:max_health", f64::from(health));
-        living.set_health(host, health);
-    }
-    for (part, slot) in WORN.into_iter().enumerate() {
-        if had.as_ref().is_some_and(|(_, w)| w[part] == want[part]) {
-            continue;
-        }
-        let stack = want[part].as_ref().and_then(|s| s.to_game(host));
-        let _ = living.set_equipment(host, slot, stack);
-    }
-    DRESSED.lock().ok().map(|mut d| d.insert(id, (health.to_bits(), want)));
 }
 
 /// Takes off what `dress` put on, so a dying doll drops its armour only from its inventory.
@@ -947,7 +1020,11 @@ fn favour_in(stack: &ItemStack) -> (u32, u32) {
 
 /// Each doll's favour as its name tag shows it: level, points into it, points it takes. Written by
 /// the server's tick and read by the client's (single player shares the process).
-static FAVOUR_SHOWN: LazyLock<Mutex<HashMap<u32, (u32, u32, u32)>>> = LazyLock::new(Default::default);
+/// With them, its health and max health, rounded up and to the nearest.
+static FAVOUR_SHOWN: LazyLock<Mutex<HashMap<u32, Shown>>> = LazyLock::new(Default::default);
+
+/// A doll's level, points into it, points it takes, health and max health.
+type Shown = (u32, u32, u32, u32, u32);
 
 /// Its name with its favour level and a bar of how far it is into the next: "Shanghai Doll  Lv 2
 /// ■■■■□□□□□□ 41%".
@@ -956,6 +1033,11 @@ fn favour_tag(name: &str, level: u32, into: u32, need: u32) -> String {
     let filled = ((fraction * 10.0).floor() as usize).min(10);
     let bar: String = "■".repeat(filled) + &"□".repeat(10 - filled);
     format!("{name}  Lv {level} {bar} {}%", (fraction * 100.0).floor() as u32)
+}
+
+/// Its health after its love meter, "  HP 41/72"; nothing when its max health isn't known.
+fn health_tag(health: u32, max: u32) -> String {
+    if max == 0 { String::new() } else { format!("  HP {}/{max}", health.min(max)) }
 }
 
 /// Points to reach level 1; each level after takes three quarters more than the one before.
@@ -1853,8 +1935,8 @@ fn mission_shown(id: u32) -> bool {
     with_fx(|fx, _| fx.missions.contains(&id)).unwrap_or_else(|| goals::on_mission(id))
 }
 
-fn favour_shown(id: u32) -> Option<(u32, u32, u32)> {
-    with_fx(|fx, _| fx.favour.iter().find(|f| f.0 == id).map(|f| (f.1, f.2, f.3)))
+fn favour_shown(id: u32) -> Option<Shown> {
+    with_fx(|fx, _| fx.favour.iter().find(|f| f.0 == id).map(|f| (f.1, f.2, f.3, f.4, f.5)))
         .unwrap_or_else(|| FAVOUR_SHOWN.lock().ok().and_then(|s| s.get(&id).copied()))
 }
 
@@ -3279,7 +3361,7 @@ impl Mod {
         let swings = goals::swings();
         let riders = goals::riders();
         let missions = goals::missions();
-        let favour: HashMap<u32, (u32, u32, u32)> = FAVOUR_SHOWN.lock().map(|f| f.clone()).unwrap_or_default();
+        let favour: HashMap<u32, Shown> = FAVOUR_SHOWN.lock().map(|f| f.clone()).unwrap_or_default();
         for p in players {
             let near: std::collections::HashSet<u32> = dolls
                 .iter()
@@ -3296,7 +3378,7 @@ impl Mod {
                 swings: swings.iter().filter(|s| near.contains(&s.0)).copied().collect(),
                 riders: riders.iter().filter(|r| near.contains(r)).copied().collect(),
                 missions: missions.iter().filter(|m| near.contains(m)).copied().collect(),
-                favour: near.iter().filter_map(|id| favour.get(id).map(|f| (*id, f.0, f.1, f.2))).collect(),
+                favour: near.iter().filter_map(|id| favour.get(id).map(|f| (*id, f.0, f.1, f.2, f.3, f.4))).collect(),
             };
             let _ = send_doll_packet(host, p.uuid, net::FX, &net::encode_fx(&fx));
             if let Ok(mut q) = FX_QUIET.lock() {
@@ -4457,9 +4539,9 @@ impl Hooks for Mod {
         if event.kind != KIND {
             return;
         }
-        let Some((level, into, need)) = favour_shown(event.entity_id) else { return };
+        let Some((level, into, need, health, max)) = favour_shown(event.entity_id) else { return };
         let Some(doll) = doll_of(host, event.entity_id) else { return };
-        *event.text = Some(favour_tag(doll.name, level, into, need));
+        *event.text = Some(favour_tag(doll.name, level, into, need) + &health_tag(health, max));
     }
 
     /// While Aya's photo is being taken, the camera is hers.
@@ -5124,11 +5206,15 @@ impl Hooks for Mod {
         }
         let (level, into, need) = favour_level(data.favour);
         goals::set_level(id, level);
-        if let Ok(mut shown) = FAVOUR_SHOWN.lock() {
-            shown.insert(id, (level, into, need));
-        }
         if let Some(doll) = doll_of(host, id) {
             dress(host, id, doll, &data.items, level);
+        }
+        // Its health as the server has it: a client is never sent a doll's max health.
+        let living = host.entity(id).and_then(|e| host.living(e));
+        let health = living.and_then(|l| l.health(host)).map_or(0, |h| h.max(0.0).ceil() as u32);
+        let max = living.and_then(|l| l.max_health(host)).map_or(0, |m| m.max(0.0).round() as u32);
+        if let Ok(mut shown) = FAVOUR_SHOWN.lock() {
+            shown.insert(id, (level, into, need, health, max));
         }
         goals::set_keep_rock(id, data.keep_rock);
         if GRID_OPEN.lock().is_ok_and(|g| g.is_empty()) && !BAUBLE_OPEN.lock().is_ok_and(|o| o.values().any(|(d, _)| *d == id)) {
@@ -5408,6 +5494,20 @@ impl Hooks for Mod {
         {
             return Flow::Cancel;
         }
+        // What it wears turns aside its share of the blow, as a player's armour does. The game's own
+        // armour pass leaves a doll alone: its type has no attribute map for the pieces to count on.
+        if event.kind == KIND
+            && let Ok(id) = u32::try_from(event.entity)
+            && let Some(k) = known(id)
+            && !armour_bypassed(event.source.damage_type)
+        {
+            let items = goals::inventory(id).unwrap_or(k.items);
+            let (armour, toughness) = armour_of(&worn_wanted(k.doll, &items));
+            let damage = event.container.new_damage();
+            if armour > 0.0 && damage > 0.0 {
+                event.container.set_new_damage(damage_after_armour(damage, armour, toughness));
+            }
+        }
         if event.kind != KIND || !event.source.damage_type.ends_with("explosion") {
             return Flow::Continue;
         }
@@ -5572,7 +5672,7 @@ const METER_HEIGHT: f32 = 1.35;
 /// facing the camera, when it is looked at or near.
 fn draw_favour_meter(host: &dyn ClientHost, event: &mut RenderLivingPreEvent<'_>) {
     let id = event.entity.id;
-    let Some((level, into, need)) = favour_shown(id) else { return };
+    let Some((level, into, need, health, max)) = favour_shown(id) else { return };
     let Some(doll) = doll_of(host, id) else { return };
     let Some(camera) = host.camera() else { return };
     let looked_at = matches!(host.crosshair_target(), Some(mod_api::CrosshairTarget::Entity { entity, .. }) if entity.id() == id);
@@ -5583,7 +5683,7 @@ fn draw_favour_meter(host: &dyn ClientHost, event: &mut RenderLivingPreEvent<'_>
     if !looked_at && !near {
         return;
     }
-    let text = Text::literal(favour_tag(doll.name, level, into, need));
+    let text = Text::literal(favour_tag(doll.name, level, into, need) + &health_tag(health, max));
     let draw = &mut *event.draw;
     draw.push();
     draw.translate([0.0, METER_HEIGHT, 0.0]);
@@ -5802,7 +5902,15 @@ mod tests {
             form_level: 3,
             giga: Some([-10, 63, 200]),
             tag: 77,
-            trades: vec![joon::Trade { cost: [Some(ItemStack::new("minecraft:emerald", 3)), None], result: Some(ItemStack::new("minecraft:bread", 2)) }],
+            trades: vec![joon::Trade::from_parts(vec![
+                Some(ItemStack::new("minecraft:emerald", 3)),
+                None,
+                None,
+                Some(ItemStack::new("minecraft:gold_ingot", 1)),
+                Some(ItemStack::new("minecraft:bread", 2)),
+                None,
+                Some(ItemStack::new("minecraft:apple", 4)),
+            ])],
         };
         assert_eq!(decode(&encode(&data).unwrap()).unwrap(), data);
         let data = DollData { owner: 7 << 64, ..DollData::default() };
@@ -5881,6 +5989,24 @@ mod tests {
     fn the_favour_tag_shows_level_and_progress() {
         assert_eq!(favour_tag("Shanghai Doll", 2, 125, 306), "Shanghai Doll  Lv 2 ■■■■□□□□□□ 40%");
         assert_eq!(favour_tag("Horai Doll", 0, 0, 100), "Horai Doll  Lv 0 □□□□□□□□□□ 0%");
+        assert_eq!(health_tag(41, 72), "  HP 41/72");
+        assert_eq!(health_tag(80, 72), "  HP 72/72");
+        assert_eq!(health_tag(5, 0), "");
+    }
+
+    #[test]
+    fn worn_armour_turns_aside_blows_as_a_players_does() {
+        let piece = |id: &str| Some(ItemStack::new(id, 1));
+        let iron = [piece("minecraft:iron_helmet"), piece("minecraft:iron_chestplate"), piece("minecraft:iron_leggings"), piece("minecraft:iron_boots")];
+        assert_eq!(armour_of(&iron), (15.0, 0.0));
+        let netherite = [piece("minecraft:netherite_helmet"), None, None, piece("minecraft:netherite_boots")];
+        assert_eq!(armour_of(&netherite), (6.0, 6.0));
+        assert_eq!(armour_of(&[None, None, None, None]), (0.0, 0.0));
+        // Full iron against a 10-point blow: 15 - 10/2 = 10 points, 40% off.
+        assert!((damage_after_armour(10.0, 15.0, 0.0) - 6.0).abs() < 1e-4);
+        // Full diamond against a 2-point blow: 20 - 2/4 = 19.5 points, 78% off.
+        assert!((damage_after_armour(2.0, 20.0, 8.0) - 0.44).abs() < 1e-4);
+        assert!(armour_bypassed("minecraft:fall") && !armour_bypassed("minecraft:mob_attack"));
     }
 
     #[test]

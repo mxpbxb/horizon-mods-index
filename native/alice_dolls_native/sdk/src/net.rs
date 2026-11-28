@@ -34,10 +34,11 @@ pub struct Fx {
     pub swings: Vec<(u32, f32)>,
     pub riders: Vec<u32>,
     pub missions: Vec<u32>,
-    pub favour: Vec<(u32, u32, u32, u32)>,
+    /// Each doll near: its id, favour level, points into it, points it takes, health and max health.
+    pub favour: Vec<(u32, u32, u32, u32, u32, u32)>,
 }
 
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 
 struct Writer(Vec<u8>);
 
@@ -134,11 +135,13 @@ pub fn encode_fx(fx: &Fx) -> Vec<u8> {
     }
     let favour = &fx.favour[..fx.favour.len().min(MAX_IDS)];
     w.u16(favour.len());
-    for &(id, level, into, need) in favour {
+    for &(id, level, into, need, health, max) in favour {
         w.u32(id);
         w.u32(level);
         w.u32(into);
         w.u32(need);
+        w.u32(health);
+        w.u32(max);
     }
     w.0
 }
@@ -165,7 +168,7 @@ pub fn decode_fx(data: &[u8]) -> Option<Fx> {
         fx.missions.push(r.u32()?);
     }
     for _ in 0..r.count(MAX_IDS)? {
-        fx.favour.push((r.u32()?, r.u32()?, r.u32()?, r.u32()?));
+        fx.favour.push((r.u32()?, r.u32()?, r.u32()?, r.u32()?, r.u32()?, r.u32()?));
     }
     r.0.is_empty().then_some(fx)
 }
@@ -245,8 +248,8 @@ pub type Shown = Option<(String, u32)>;
 /// One of her trades on her screen.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ShownTrade {
-    /// What is paid (two stacks), then what is got.
-    pub parts: [Shown; 3],
+    /// What is paid (`joon::PAY` stacks), then what is got (`joon::GET`).
+    pub parts: [Shown; crate::joon::PARTS],
     /// How many times her stock pays it out; `u32::MAX` when it pays nothing out.
     pub stock: u32,
     /// Whether the viewer has what it takes.
@@ -340,7 +343,10 @@ pub fn decode_joon(data: &[u8]) -> Result<Option<JoonView>, ()> {
         let n = r.count(MAX_JOON)?;
         let trades = (0..n)
             .map(|_| {
-                let parts = [read_shown(r)?, read_shown(r)?, read_shown(r)?];
+                let mut parts: [Shown; crate::joon::PARTS] = Default::default();
+                for p in &mut parts {
+                    *p = read_shown(r)?;
+                }
                 Some(ShownTrade { parts, stock: r.u32()?, affordable: r.u8()? != 0 })
             })
             .collect::<Option<Vec<_>>>()?;
@@ -359,8 +365,8 @@ pub fn decode_joon(data: &[u8]) -> Result<Option<JoonView>, ()> {
     if r.0.is_empty() { Ok(Some(v)) } else { Err(()) }
 }
 
-/// What a player did on Joon's screen. Trades and parts are by index (parts: 0 and 1 what is paid,
-/// 2 what is got); the server checks every one.
+/// What a player did on Joon's screen. Trades and parts are by index (parts: `0..joon::PAY` what is
+/// paid, then what is got); the server checks every one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JoonAct {
     /// Part `part` of trade `trade` set to what is in their slot `slot` (as `JoonView::items`
@@ -475,7 +481,7 @@ mod tests {
             swings: vec![(7, 0.5)],
             riders: vec![3, 9],
             missions: vec![11],
-            favour: vec![(7, 2, 125, 306), (3, 0, 0, 100)],
+            favour: vec![(7, 2, 125, 306, 41, 72), (3, 0, 0, 100, 30, 30)],
         };
         assert_eq!(decode_fx(&encode_fx(&fx)), Some(fx));
         assert_eq!(decode_fx(&encode_fx(&Fx::default())), Some(Fx::default()));
@@ -489,7 +495,7 @@ mod tests {
             swings: vec![(1, 0.1); 200],
             riders: vec![1; 50],
             missions: vec![1; 10],
-            favour: vec![(1, 1, 1, 1); 200],
+            favour: vec![(1, 1, 1, 1, 1, 1); 200],
         };
         let bytes = encode_fx(&fx);
         assert!(bytes.len() <= 30_000, "{}", bytes.len());
@@ -543,7 +549,16 @@ mod tests {
             owner: "Alice".into(),
             secs: 120,
             trades: vec![ShownTrade {
-                parts: [Some(("minecraft:emerald".into(), 3)), None, Some(("minecraft:bread".into(), 6))],
+                parts: [
+                    Some(("minecraft:emerald".into(), 3)),
+                    None,
+                    Some(("minecraft:gold_ingot".into(), 1)),
+                    None,
+                    Some(("minecraft:bread".into(), 6)),
+                    None,
+                    None,
+                    Some(("minecraft:apple".into(), 2)),
+                ],
                 stock: 4,
                 affordable: true,
             }],
